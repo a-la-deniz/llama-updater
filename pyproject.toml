@@ -1,0 +1,19 @@
+# pyproject.toml
+[project]
+name = "llama-updater"
+version = "0.1.0"
+description = "A tool to update llama.cpp CUDA binaries on Windows"
+dependencies = [
+    "requests",
+]
+requires-python = ">=3.10"
+
+[project.scripts]
+llama-update = "llama_updater.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llama_updater"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
