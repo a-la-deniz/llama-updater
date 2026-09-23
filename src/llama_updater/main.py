@@ -1,14 +1,18 @@
-import requests
 import os
-import zipfile
-import shutil
 import re
+import shutil
 import subprocess
+import zipfile
 from pathlib import Path
+
+import requests
+
 
 def get_current_version():
     try:
-        result = subprocess.run(["llama-server", "--version"], capture_output=True, text=True, check=False)
+        result = subprocess.run(
+            ["llama-server", "--version"], capture_output=True, text=True, check=False
+        )
         output = result.stdout + result.stderr
         match = re.search(r"version: (\d+)", output)
         if match:
@@ -17,10 +21,11 @@ def get_current_version():
         pass
     return None
 
+
 def main():
     repo = "ggml-org/llama.cpp"
-    api_url = f"https://api.github.com/repos/{repo}/releases/latest"
-    
+    api_url = f"https://api.github.com/repos/{repo}/releases"
+
     print("Checking current version...")
     current_version = get_current_version()
     if current_version:
@@ -32,13 +37,35 @@ def main():
     try:
         response = requests.get(api_url)
         response.raise_for_status()
-        release = response.json()
+        releases = response.json()
+
+        # Find the first release that has at least one binary asset
+        release = None
+        for r in releases:
+            if any("bin" in a["name"] for a in r["assets"]):
+                release = r
+                break
+
+        if not release:
+            print("Could not find a release with binary assets.")
+            return
+
     except Exception as e:
         print(f"Failed to fetch release information: {e}")
         return
 
-    # Find the latest CUDA 13 binary asset
-    cuda_binary_asset = next((a for a in release["assets"] if a["name"].startswith("llama-b") and "-bin-win-cuda-13" in a["name"] and a["name"].endswith(".zip")), None)
+    # Find the latest CUDA binary asset (specifically looking for cuda-13 and x64)
+    cuda_binary_asset = next(
+        (
+            a
+            for a in release["assets"]
+            if a["name"].startswith("llama-b")
+            and "bin-win-cuda-13" in a["name"]
+            and "-x64" in a["name"]
+            and a["name"].endswith(".zip")
+        ),
+        None,
+    )
 
     if not cuda_binary_asset:
         print("Could not find a CUDA 13 binary asset in the latest release.")
@@ -47,9 +74,11 @@ def main():
     # Extract version from the binary asset name (e.g., llama-b9632-bin-win-cuda-13.3-x64.zip -> 9632)
     match = re.search(r"llama-b(\d+)-bin", cuda_binary_asset["name"])
     if not match:
-        print(f"Could not determine latest version from asset name: {cuda_binary_asset['name']}")
+        print(
+            f"Could not determine latest version from asset name: {cuda_binary_asset['name']}"
+        )
         return
-    
+
     latest_version = match.group(1)
 
     if current_version and current_version == latest_version:
@@ -61,18 +90,24 @@ def main():
     # Extract CUDA version from the binary asset name (e.g., llama-b9632-bin-win-cuda-13.3-x64.zip -> 13.3)
     cuda_ver_match = re.search(r"cuda-([\d\.]+)-x64", cuda_binary_asset["name"])
     if not cuda_ver_match:
-        print(f"Could not determine CUDA version from asset name: {cuda_binary_asset['name']}")
+        print(
+            f"Could not determine CUDA version from asset name: {cuda_binary_asset['name']}"
+        )
         return
-    
+
     cuda_version = cuda_ver_match.group(1)
     print(f"Detected CUDA version: {cuda_version}")
 
     # Find the corresponding CUDA runtime (DLLs) asset
     runtime_asset_name = f"cudart-llama-bin-win-cuda-{cuda_version}-x64.zip"
-    cuda_runtime_asset = next((a for a in release["assets"] if a["name"] == runtime_asset_name), None)
+    cuda_runtime_asset = next(
+        (a for a in release["assets"] if a["name"] == runtime_asset_name), None
+    )
 
     if not cuda_runtime_asset:
-        print(f"Could not find the corresponding CUDA runtime asset for version {cuda_version}.")
+        print(
+            f"Could not find the corresponding CUDA runtime asset for version {cuda_version}."
+        )
         return
 
     binary_url = cuda_binary_asset["browser_download_url"]
@@ -97,10 +132,10 @@ def main():
         r.raise_for_status()
         with open(temp_zip, "wb") as f:
             shutil.copyfileobj(r.raw, f)
-        
+
         with zipfile.ZipFile(temp_zip, "r") as zip_ref:
             zip_ref.extractall(target_dir)
-        
+
         temp_zip.unlink()
 
     try:
@@ -109,6 +144,7 @@ def main():
         print("Update complete!")
     except Exception as e:
         print(f"An error occurred during update: {e}")
+
 
 if __name__ == "__main__":
     main()
