@@ -1,11 +1,27 @@
+import csv
+import io
 import os
 import re
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
 import requests
+
+REPO = "ggml-org/llama.cpp"
+API_TIMEOUT = 30
+# (connect, read) timeout for downloads; read timeout applies per chunk, not the whole file
+DOWNLOAD_TIMEOUT = (10, 60)
+
+
+def github_headers():
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def get_current_version():
@@ -14,17 +30,56 @@ def get_current_version():
             ["llama-server", "--version"], capture_output=True, text=True, check=False
         )
         output = result.stdout + result.stderr
-        match = re.search(r"version: (\d+)", output)
+        # Newer builds: "version: 0.7.0-dev (build 11756, commit ...)"
+        # Older builds: "version: 4567 (abc1234)"
+        match = re.search(r"\(build (\d+)", output) or re.search(
+            r"version: (\d+) \(", output
+        )
         if match:
-            return match.group(1)
+            return int(match.group(1))
     except Exception:
         pass
     return None
 
 
+def find_cuda_assets(release):
+    """Return (binary_asset, runtime_asset, build, cuda_version) if the release has a
+    complete Windows CUDA 13 x64 build, otherwise None."""
+    for asset in release["assets"]:
+        # e.g. llama-b9632-bin-win-cuda-13.3-x64.zip
+        match = re.fullmatch(r"llama-b(\d+)-bin-win-cuda-(13[\d.]*)-x64\.zip", asset["name"])
+        if not match:
+            continue
+        build, cuda_version = int(match.group(1)), match.group(2)
+        runtime_name = f"cudart-llama-bin-win-cuda-{cuda_version}-x64.zip"
+        runtime = next((a for a in release["assets"] if a["name"] == runtime_name), None)
+        if runtime:
+            return asset, runtime, build, cuda_version
+    return None
+
+
+def running_llama_processes(target_dir):
+    """Return names of running processes whose executable also exists in target_dir."""
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True, check=True
+        )
+    except Exception:
+        return []
+    names = {row[0] for row in csv.reader(io.StringIO(result.stdout)) if row}
+    return sorted(n for n in names if (target_dir / n).exists() and n.lower().startswith("llama"))
+
+
+def download(url, dest):
+    with requests.get(url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+        r.raise_for_status()
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                f.write(chunk)
+
+
 def main():
-    repo = "ggml-org/llama.cpp"
-    api_url = f"https://api.github.com/repos/{repo}/releases"
+    api_url = f"https://api.github.com/repos/{REPO}/releases"
 
     print("Checking current version...")
     current_version = get_current_version()
@@ -35,84 +90,42 @@ def main():
 
     print("Fetching latest release information...")
     try:
-        response = requests.get(api_url)
+        response = requests.get(api_url, headers=github_headers(), timeout=API_TIMEOUT)
         response.raise_for_status()
         releases = response.json()
-
-        # Find the first release that has at least one binary asset
-        release = None
-        for r in releases:
-            if any("bin" in a["name"] for a in r["assets"]):
-                release = r
-                break
-
-        if not release:
-            print("Could not find a release with binary assets.")
-            return
-
     except Exception as e:
         print(f"Failed to fetch release information: {e}")
         return
 
-    # Find the latest CUDA binary asset (specifically looking for cuda-13 and x64)
-    cuda_binary_asset = next(
-        (
-            a
-            for a in release["assets"]
-            if a["name"].startswith("llama-b")
-            and "bin-win-cuda-13" in a["name"]
-            and "-x64" in a["name"]
-            and a["name"].endswith(".zip")
-        ),
-        None,
-    )
+    # CI uploads platform builds at different times, so the newest release may not
+    # have the Windows CUDA assets yet. Take the first one that does.
+    found = None
+    for release in releases:
+        found = find_cuda_assets(release)
+        if found:
+            break
 
-    if not cuda_binary_asset:
-        print("Could not find a CUDA 13 binary asset in the latest release.")
+    if not found:
+        print("Could not find a recent release with CUDA 13 Windows binaries.")
         return
 
-    # Extract version from the binary asset name (e.g., llama-b9632-bin-win-cuda-13.3-x64.zip -> 9632)
-    match = re.search(r"llama-b(\d+)-bin", cuda_binary_asset["name"])
-    if not match:
-        print(
-            f"Could not determine latest version from asset name: {cuda_binary_asset['name']}"
-        )
-        return
+    binary_asset, runtime_asset, latest_version, cuda_version = found
 
-    latest_version = match.group(1)
-
-    if current_version and current_version == latest_version:
-        print(f"Already up to date (version {current_version}). No update needed.")
+    if current_version and current_version >= latest_version:
+        if current_version == latest_version:
+            print(f"Already up to date (version {current_version}). No update needed.")
+        else:
+            print(
+                f"Local build {current_version} is newer than latest release "
+                f"{latest_version}. Skipping."
+            )
         return
 
     print(f"Update available: {current_version or 'None'} -> {latest_version}")
-
-    # Extract CUDA version from the binary asset name (e.g., llama-b9632-bin-win-cuda-13.3-x64.zip -> 13.3)
-    cuda_ver_match = re.search(r"cuda-([\d\.]+)-x64", cuda_binary_asset["name"])
-    if not cuda_ver_match:
-        print(
-            f"Could not determine CUDA version from asset name: {cuda_binary_asset['name']}"
-        )
-        return
-
-    cuda_version = cuda_ver_match.group(1)
     print(f"Detected CUDA version: {cuda_version}")
 
-    # Find the corresponding CUDA runtime (DLLs) asset
-    runtime_asset_name = f"cudart-llama-bin-win-cuda-{cuda_version}-x64.zip"
-    cuda_runtime_asset = next(
-        (a for a in release["assets"] if a["name"] == runtime_asset_name), None
-    )
-
-    if not cuda_runtime_asset:
-        print(
-            f"Could not find the corresponding CUDA runtime asset for version {cuda_version}."
-        )
-        return
-
-    binary_url = cuda_binary_asset["browser_download_url"]
-    runtime_url = cuda_runtime_asset["browser_download_url"]
-
+    binary_url = binary_asset["browser_download_url"]
+    runtime_url = runtime_asset["browser_download_url"]
     print(f"Latest CUDA Binary URL: {binary_url}")
     print(f"Latest CUDA Runtime URL: {runtime_url}")
 
@@ -125,22 +138,29 @@ def main():
         target_dir = Path.cwd()
         print(f"llama-server not found, using current directory: {target_dir}")
 
-    def download_and_unpack(url, filename):
-        print(f"Downloading and unpacking {filename}...")
-        temp_zip = Path(os.getenv("TEMP", ".")) / filename
-        r = requests.get(url, stream=True)
-        r.raise_for_status()
-        with open(temp_zip, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-
-        with zipfile.ZipFile(temp_zip, "r") as zip_ref:
-            zip_ref.extractall(target_dir)
-
-        temp_zip.unlink()
+    # Windows can't overwrite executables or DLLs that are in use
+    running = running_llama_processes(target_dir)
+    if running:
+        print(f"Close these running processes before updating: {', '.join(running)}")
+        return
 
     try:
-        download_and_unpack(binary_url, "llama-bin.zip")
-        download_and_unpack(runtime_url, "llama-rt.zip")
+        with tempfile.TemporaryDirectory(prefix="llama-update-") as tmp:
+            tmp = Path(tmp)
+            staging = tmp / "staging"
+            for url, filename in [
+                (binary_url, binary_asset["name"]),
+                (runtime_url, runtime_asset["name"]),
+            ]:
+                print(f"Downloading {filename}...")
+                zip_path = tmp / filename
+                download(url, zip_path)
+                with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                    zip_ref.extractall(staging)
+
+            # Only touch the install once everything downloaded and unpacked cleanly
+            print(f"Installing to {target_dir}...")
+            shutil.copytree(staging, target_dir, dirs_exist_ok=True)
         print("Update complete!")
     except Exception as e:
         print(f"An error occurred during update: {e}")
