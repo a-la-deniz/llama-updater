@@ -14,6 +14,8 @@ REPO = "ggml-org/llama.cpp"
 API_TIMEOUT = 30
 # (connect, read) timeout for downloads; read timeout applies per chunk, not the whole file
 DOWNLOAD_TIMEOUT = (10, 60)
+# Records which CUDA runtime version was last installed, so it's only re-downloaded on change
+CUDART_MARKER = ".llama-updater-cudart"
 
 
 def github_headers():
@@ -68,6 +70,13 @@ def running_llama_processes(target_dir):
         return []
     names = {row[0] for row in csv.reader(io.StringIO(result.stdout)) if row}
     return sorted(n for n in names if (target_dir / n).exists() and n.lower().startswith("llama"))
+
+
+def installed_cudart_version(target_dir):
+    marker = target_dir / CUDART_MARKER
+    if not marker.exists() or not any(target_dir.glob("cudart64_*.dll")):
+        return None
+    return marker.read_text(encoding="utf-8").strip() or None
 
 
 def download(url, dest):
@@ -144,14 +153,17 @@ def main():
         print(f"Close these running processes before updating: {', '.join(running)}")
         return
 
+    downloads = [(binary_url, binary_asset["name"])]
+    if installed_cudart_version(target_dir) == cuda_version:
+        print(f"CUDA runtime {cuda_version} already installed, skipping its download.")
+    else:
+        downloads.append((runtime_url, runtime_asset["name"]))
+
     try:
         with tempfile.TemporaryDirectory(prefix="llama-update-") as tmp:
             tmp = Path(tmp)
             staging = tmp / "staging"
-            for url, filename in [
-                (binary_url, binary_asset["name"]),
-                (runtime_url, runtime_asset["name"]),
-            ]:
+            for url, filename in downloads:
                 print(f"Downloading {filename}...")
                 zip_path = tmp / filename
                 download(url, zip_path)
@@ -161,6 +173,7 @@ def main():
             # Only touch the install once everything downloaded and unpacked cleanly
             print(f"Installing to {target_dir}...")
             shutil.copytree(staging, target_dir, dirs_exist_ok=True)
+            (target_dir / CUDART_MARKER).write_text(cuda_version, encoding="utf-8")
         print("Update complete!")
     except Exception as e:
         print(f"An error occurred during update: {e}")
